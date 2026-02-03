@@ -1,0 +1,4 @@
+gitlab.com/greyxor/slogor v1.6.6 h1:SE/RbrEhe0dQ3W94wiaPhoQgbAyKme7X7kvcEeDrGOM=
+gitlab.com/greyxor/slogor v1.6.6/go.mod h1:aj17VCg12qGr1oqZwc/IqJGe9z0vfKLySCGSkLjyN8s=
+golang.org/x/sys v0.40.0 h1:DBZZqJ2Rkml6QMQsZywtnjnnGvHza6BTfYFWY9kjEWQ=
+golang.org/x/sys v0.40.0/go.mod h1:OgkHotnGiDImocRcuBABYBEXf8A9a87e/uXjp9XT3ks=
