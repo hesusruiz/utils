@@ -59,6 +59,12 @@ type Config struct {
 	MaxRetries     int
 	DisableRetries bool
 
+	// Individual retry flags for state-changing HTTP methods (GET is always retried when retries are enabled).
+	RetryPost   bool
+	RetryPut    bool
+	RetryPatch  bool
+	RetryDelete bool
+
 	// InitialWait is the base backoff wait before the first retry (default: 200ms).
 	InitialWait time.Duration
 
@@ -211,16 +217,8 @@ func (c *Client) Delete(ctx context.Context, path string) (*Response, error) {
 	return c.R(ctx).Delete(path)
 }
 
-type retryOverride int
-
-const (
-	retryDefault retryOverride = iota
-	retryAlways
-	retryNever
-)
-
 // Request builds an individual HTTP call with optional path parameters, query parameters,
-// headers, body, and retry overrides.
+// headers, and body.
 type Request struct {
 	client      *Client
 	ctx         context.Context
@@ -229,7 +227,6 @@ type Request struct {
 	headers     map[string]string
 	bearerToken string
 	body        any
-	retryMode   retryOverride
 }
 
 // PathParam sets a single path parameter replacing `{key}` in the request path.
@@ -291,18 +288,6 @@ func (r *Request) Body(body any) *Request {
 // Form sets a url.Values payload to be sent as application/x-www-form-urlencoded.
 func (r *Request) Form(data url.Values) *Request {
 	r.body = data
-	return r
-}
-
-// Retry forces retries to be enabled for this request even if the HTTP method is non-idempotent (e.g., POST, PATCH).
-func (r *Request) Retry() *Request {
-	r.retryMode = retryAlways
-	return r
-}
-
-// NoRetry disables retries for this specific request.
-func (r *Request) NoRetry() *Request {
-	r.retryMode = retryNever
 	return r
 }
 
@@ -418,7 +403,7 @@ func (c *Client) execute(r *Request, method, path string) (*Response, error) {
 		return nil, err
 	}
 
-	maxRetries := c.maxRetriesFor(method, r.retryMode)
+	maxRetries := c.maxRetriesFor(method)
 
 	var lastResp *Response
 	var lastErr error
@@ -664,23 +649,31 @@ func prepareBody(body any) ([]byte, string, error) {
 	}
 }
 
-func (c *Client) maxRetriesFor(method string, mode retryOverride) int {
-	if mode == retryNever || c.cfg.DisableRetries || c.cfg.MaxRetries <= 0 {
+func (c *Client) maxRetriesFor(method string) int {
+	if c.cfg.DisableRetries || c.cfg.MaxRetries <= 0 {
 		return 0
 	}
-	if mode == retryAlways || isIdempotent(method) {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
 		return c.cfg.MaxRetries
+	case http.MethodPost:
+		if c.cfg.RetryPost {
+			return c.cfg.MaxRetries
+		}
+	case http.MethodPut:
+		if c.cfg.RetryPut {
+			return c.cfg.MaxRetries
+		}
+	case http.MethodPatch:
+		if c.cfg.RetryPatch {
+			return c.cfg.MaxRetries
+		}
+	case http.MethodDelete:
+		if c.cfg.RetryDelete {
+			return c.cfg.MaxRetries
+		}
 	}
 	return 0
-}
-
-func isIdempotent(method string) bool {
-	switch method {
-	case http.MethodGet, http.MethodHead, http.MethodPut, http.MethodDelete, http.MethodOptions:
-		return true
-	default:
-		return false
-	}
 }
 
 func shouldRetry(resp *Response, err error) bool {

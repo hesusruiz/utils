@@ -246,17 +246,21 @@ func TestRetriesAndIdempotency(t *testing.T) {
 		t.Fatalf("expected 429 after 1 attempt for non-idempotent POST, got status=%d attempts=%d", resp.StatusCode, resp.Attempts)
 	}
 
-	// POST with .Retry() retries and preserves body across attempts
+	// Client with Config.RetryPost = true retries client.Post() automatically and preserves body
+	postClient := New(srv.URL, &Config{
+		MaxRetries:       3,
+		RetryPost:        true,
+		InitialWait:      10 * time.Millisecond,
+		MaxWait:          50 * time.Millisecond,
+		DisableRateLimit: true,
+	})
 	postAttempts.Store(0)
-	resp, err = client.R(ctx).
-		Body(map[string]string{"payload": "important"}).
-		Retry().
-		Post("/flaky-post")
+	resp, err = postClient.Post(ctx, "/flaky-post", map[string]string{"payload": "important"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !resp.IsSuccess() || resp.Attempts != 2 {
-		t.Fatalf("expected 200 after 2 attempts for opted-in POST, got status=%d attempts=%d", resp.StatusCode, resp.Attempts)
+		t.Fatalf("expected 200 after 2 attempts with Config.RetryPost=true, got status=%d attempts=%d", resp.StatusCode, resp.Attempts)
 	}
 }
 
