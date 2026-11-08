@@ -321,3 +321,69 @@ func TestPostCompletionRateLimiting(t *testing.T) {
 		}
 	}
 }
+
+func TestTokenBucketRateLimiting(t *testing.T) {
+	var inFlight atomic.Int32
+	var maxInFlight atomic.Int32
+	var mu sync.Mutex
+	var arrivals []time.Time
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cur := inFlight.Add(1)
+		for {
+			prev := maxInFlight.Load()
+			if cur <= prev || maxInFlight.CompareAndSwap(prev, cur) {
+				break
+			}
+		}
+
+		mu.Lock()
+		arrivals = append(arrivals, time.Now())
+		mu.Unlock()
+
+		// Simulate 60ms of server work so burst calls overlap in-flight
+		time.Sleep(60 * time.Millisecond)
+		inFlight.Add(-1)
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	// 20 requests/sec (1 token every 50ms) with a burst of 2
+	client := New(srv.URL, &Config{
+		RequestsPerSecond: 20,
+		Burst:             2,
+		DisableRetries:    true,
+	})
+
+	start := time.Now()
+	const numCalls = 4
+	var wg sync.WaitGroup
+	wg.Add(numCalls)
+	for range numCalls {
+		go func() {
+			defer wg.Done()
+			resp, err := client.Get(context.Background(), "/burst")
+			if err != nil || !resp.IsSuccess() {
+				t.Errorf("call failed: err=%v resp=%v", err, resp)
+			}
+		}()
+	}
+	wg.Wait()
+	totalElapsed := time.Since(start)
+
+	// Because Burst == 2 and MinInterval == 0, the first 2 calls run concurrently in-flight,
+	// call 3 starts at ~50ms, and call 4 starts at ~100ms.
+	if maxInFlight.Load() < 2 {
+		t.Fatalf("expected concurrent in-flight requests with Burst=2, got maxInFlight=%d", maxInFlight.Load())
+	}
+	if len(arrivals) != numCalls {
+		t.Fatalf("expected %d arrivals, got %d", numCalls, len(arrivals))
+	}
+	// 4 calls with burst 2 at 20 req/s (50ms spacing) requires ~100ms before the 4th call fires
+	if totalElapsed < 90*time.Millisecond {
+		t.Fatalf("expected token bucket to throttle calls 3 & 4 (~100ms+), but finished in %v", totalElapsed)
+	}
+}
+

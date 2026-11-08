@@ -1,6 +1,8 @@
-// Package htc provides a lightweight, debuggable HTTP client wrapper scoped to a
+// Package htc provides a lightweight HTTP client wrapper scoped to a
 // single downstream service. It adds:
-//   - Client-side post-completion rate limiting (minimum time gap after a call completes)
+//   - Two client-side rate limiting modes:
+//     1. Post-completion serialized cooldown (MinInterval: minimum time gap after a call completes, for fragile servers)
+//     2. Token bucket rate limiting via golang.org/x/time/rate (RequestsPerSecond + Burst, allowing concurrent in-flight calls)
 //   - Server-side rate limit handling (honoring Retry-After headers)
 //   - Exponential backoff retries with jitter for transient errors (network errors, 429, 502, 503, 504)
 //   - Fluent request construction (path parameters, query parameters, headers, JSON/form bodies)
@@ -19,9 +21,11 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hesusruiz/utils/errl"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -62,11 +66,22 @@ type Config struct {
 	// Note: if the server sends a Retry-After header larger than MaxWait, Retry-After is honored.
 	MaxWait time.Duration
 
+	// Rate Limiting (two modes supported):
+	//
+	// Mode 1 (Fragile servers - default when RequestsPerSecond is 0):
 	// MinInterval is the minimum time that must elapse after a call completes
-	// before the next call is sent to the server (default: 100ms).
-	// Set DisableRateLimit: true (or MinInterval < 0) to disable client-side spacing.
-	MinInterval      time.Duration
-	DisableRateLimit bool
+	// before the next call is sent to the server (default: 100ms when RequestsPerSecond == 0).
+	// This mode serializes calls so at most 1 call is in flight at a time.
+	//
+	// Mode 2 (General servers - Token Bucket via golang.org/x/time/rate):
+	// Set RequestsPerSecond > 0 (and optional Burst, default 1) to use a token bucket limiter.
+	// When RequestsPerSecond > 0 and MinInterval == 0, concurrent in-flight requests are allowed.
+	//
+	// Set DisableRateLimit: true (or MinInterval < 0) to disable client-side rate limiting completely.
+	MinInterval       time.Duration
+	RequestsPerSecond float64
+	Burst             int
+	DisableRateLimit  bool
 
 	// MaxResponseBodySize caps how many bytes are read from a response body (default: 10MB).
 	MaxResponseBodySize int64
@@ -79,10 +94,17 @@ type Client struct {
 	cfg        Config
 	httpClient *http.Client
 
-	// gate serializes outbound calls and protects nextAllowedAt so that the server
+	// gate is used when MinInterval > 0 to serialize outbound calls so that the server
 	// never receives a new request until at least MinInterval after the previous call completed.
 	gate          chan struct{}
 	nextAllowedAt time.Time
+
+	// limiter is used when RequestsPerSecond > 0 for token-bucket rate limiting (golang.org/x/time/rate).
+	limiter *rate.Limiter
+
+	// retryAfterMu protects retryAfterUntil for server-side Retry-After headers when running concurrently.
+	retryAfterMu    sync.Mutex
+	retryAfterUntil time.Time
 }
 
 // New creates a new Client for the given downstream baseURL.
@@ -108,12 +130,23 @@ func New(baseURL string, cfg *Config) *Client {
 	if c.MaxWait <= 0 {
 		c.MaxWait = DefaultMaxWait
 	}
-	if c.MinInterval < 0 {
+
+	var limiter *rate.Limiter
+	if c.MinInterval < 0 || c.RequestsPerSecond < 0 {
 		c.DisableRateLimit = true
 		c.MinInterval = 0
-	} else if c.MinInterval == 0 && !c.DisableRateLimit {
-		c.MinInterval = DefaultMinInterval
+		c.RequestsPerSecond = 0
+	} else if !c.DisableRateLimit {
+		if c.RequestsPerSecond > 0 {
+			if c.Burst <= 0 {
+				c.Burst = 1
+			}
+			limiter = rate.NewLimiter(rate.Limit(c.RequestsPerSecond), c.Burst)
+		} else if c.MinInterval == 0 {
+			c.MinInterval = DefaultMinInterval
+		}
 	}
+
 	if c.MaxResponseBodySize <= 0 {
 		c.MaxResponseBodySize = DefaultMaxResponseBodySize
 	}
@@ -134,7 +167,8 @@ func New(baseURL string, cfg *Config) *Client {
 		httpClient: &http.Client{
 			Timeout: c.Timeout,
 		},
-		gate: gate,
+		gate:    gate,
+		limiter: limiter,
 	}
 }
 
@@ -434,9 +468,8 @@ func (c *Client) execute(r *Request, method, path string) (*Response, error) {
 	return lastResp, nil
 }
 
-// doSingleAttempt acquires the rate-limiting gate, waits until nextAllowedAt, performs one
-// HTTP transaction, reads the body, updates nextAllowedAt based on completion time and Retry-After,
-// and releases the gate.
+// doSingleAttempt applies the configured rate-limiting strategy (serialized post-completion MinInterval
+// and/or token-bucket rate.Limiter, plus server Retry-After), performs one HTTP transaction, and reads the body.
 func (c *Client) doSingleAttempt(
 	ctx context.Context,
 	method string,
@@ -445,37 +478,57 @@ func (c *Client) doSingleAttempt(
 	contentType string,
 	r *Request,
 ) (*Response, time.Duration, error) {
-	// 1. Acquire the single-flight gate so calls are serialized and properly spaced.
-	select {
-	case <-c.gate:
-	case <-ctx.Done():
-		return nil, 0, errl.Error(ctx.Err())
-	}
+	useSerializedGate := !c.cfg.DisableRateLimit && c.cfg.MinInterval > 0
 
-	// 2. Wait until the post-completion cooldown (or server Retry-After) from the previous call has elapsed.
-	if wait := time.Until(c.nextAllowedAt); wait > 0 {
-		if err := sleepWithContext(ctx, wait); err != nil {
-			c.gate <- struct{}{}
-			return nil, 0, errl.Error(err)
+	// 1a. If MinInterval is active (fragile-server mode), acquire the single-flight gate
+	// so at most 1 call is in flight and waits until MinInterval after the previous call finished.
+	if useSerializedGate {
+		select {
+		case <-c.gate:
+		case <-ctx.Done():
+			return nil, 0, errl.Error(ctx.Err())
+		}
+
+		if wait := time.Until(c.nextAllowedAt); wait > 0 {
+			if err := sleepWithContext(ctx, wait); err != nil {
+				c.gate <- struct{}{}
+				return nil, 0, errl.Error(err)
+			}
+		}
+	} else {
+		// 1b. In concurrent mode (Token Bucket or rate-limit disabled), still honor any server Retry-After.
+		if wait := c.retryAfterWait(); wait > 0 {
+			if err := sleepWithContext(ctx, wait); err != nil {
+				return nil, 0, errl.Error(err)
+			}
 		}
 	}
 
-	// Ensure we always update nextAllowedAt on completion and release the gate.
 	var retryAfter time.Duration
 	defer func() {
 		completedAt := time.Now()
-		if !c.cfg.DisableRateLimit && c.cfg.MinInterval > 0 {
+		if retryAfter > 0 {
+			c.recordRetryAfter(completedAt.Add(retryAfter))
+		}
+		if useSerializedGate {
 			if minNext := completedAt.Add(c.cfg.MinInterval); minNext.After(c.nextAllowedAt) {
 				c.nextAllowedAt = minNext
 			}
-		}
-		if retryAfter > 0 {
-			if raNext := completedAt.Add(retryAfter); raNext.After(c.nextAllowedAt) {
-				c.nextAllowedAt = raNext
+			if retryAfter > 0 {
+				if raNext := completedAt.Add(retryAfter); raNext.After(c.nextAllowedAt) {
+					c.nextAllowedAt = raNext
+				}
 			}
+			c.gate <- struct{}{}
 		}
-		c.gate <- struct{}{}
 	}()
+
+	// 2. If Token Bucket (golang.org/x/time/rate) is configured, wait for a token.
+	if c.limiter != nil {
+		if err := c.limiter.Wait(ctx); err != nil {
+			return nil, 0, errl.Errorf("rate limiter wait failed: %w", err)
+		}
+	}
 
 	// 3. Resolve Bearer token (per-request > TokenProvider > static Config.BearerToken).
 	token := r.bearerToken
@@ -709,6 +762,20 @@ func statusCodeOf(resp *Response) int {
 		return 0
 	}
 	return resp.StatusCode
+}
+
+func (c *Client) retryAfterWait() time.Duration {
+	c.retryAfterMu.Lock()
+	defer c.retryAfterMu.Unlock()
+	return time.Until(c.retryAfterUntil)
+}
+
+func (c *Client) recordRetryAfter(until time.Time) {
+	c.retryAfterMu.Lock()
+	defer c.retryAfterMu.Unlock()
+	if until.After(c.retryAfterUntil) {
+		c.retryAfterUntil = until
+	}
 }
 
 // Errorf is a small helper for formatting errors if needed by callers.
