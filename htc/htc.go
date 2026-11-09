@@ -45,8 +45,8 @@ type RateLimitMode int
 const (
 	// RateLimitNone (the zero value) disables client-side rate limiting by default.
 	RateLimitNone RateLimitMode = iota
-	// RateLimitFragile serializes calls and enforces a minimum post-completion gap (MinInterval, default 100ms).
-	RateLimitFragile
+	// RateLimitSerial serializes calls and enforces a minimum post-completion gap (MinInterval, default 100ms).
+	RateLimitSerial
 	// RateLimitTokenBucket uses golang.org/x/time/rate with RequestsPerSecond (default 10) and Burst (default 1).
 	RateLimitTokenBucket
 )
@@ -88,7 +88,7 @@ type Config struct {
 
 	// RateLimitMode selects the client-side rate limiting mechanism (default: RateLimitNone):
 	//   - RateLimitNone: no client-side rate limiting (MinInterval, RequestsPerSecond, and Burst must be 0).
-	//   - RateLimitFragile: post-completion serialized cooldown using MinInterval (default: 100ms; RequestsPerSecond and Burst must be 0).
+	//   - RateLimitSerial: post-completion serialized cooldown using MinInterval (default: 100ms; RequestsPerSecond and Burst must be 0).
 	//   - RateLimitTokenBucket: token bucket via golang.org/x/time/rate using RequestsPerSecond (default: 10) and Burst (default: 1; MinInterval must be 0).
 	RateLimitMode     RateLimitMode
 	MinInterval       time.Duration
@@ -106,7 +106,7 @@ type Client struct {
 	cfg        Config
 	httpClient *http.Client
 
-	// gate is used when RateLimitMode == RateLimitFragile to serialize outbound calls so that the server
+	// gate is used when RateLimitMode == RateLimitSerial to serialize outbound calls so that the server
 	// never receives a new request until at least MinInterval after the previous call completed.
 	gate          chan struct{}
 	nextAllowedAt time.Time
@@ -168,9 +168,9 @@ func New(baseURL string, cfg *Config) (*Client, error) {
 		if c.MinInterval != 0 || c.RequestsPerSecond != 0 || c.Burst != 0 {
 			return nil, errl.Errorf("rate limit parameters (MinInterval, RequestsPerSecond, Burst) cannot be set when RateLimitMode is RateLimitNone")
 		}
-	case RateLimitFragile:
+	case RateLimitSerial:
 		if c.RequestsPerSecond != 0 || c.Burst != 0 {
-			return nil, errl.Errorf("RequestsPerSecond and Burst cannot be set when RateLimitMode is RateLimitFragile")
+			return nil, errl.Errorf("RequestsPerSecond and Burst cannot be set when RateLimitMode is RateLimitSerial")
 		}
 		if c.MinInterval < 0 {
 			return nil, errl.Errorf("MinInterval cannot be negative")
@@ -506,7 +506,7 @@ func (c *Client) doSingleAttempt(
 	contentType string,
 	r *Request,
 ) (*Response, time.Duration, error) {
-	useSerializedGate := c.cfg.RateLimitMode == RateLimitFragile
+	useSerializedGate := c.cfg.RateLimitMode == RateLimitSerial
 
 	// 1a. If MinInterval is active (fragile-server mode), acquire the single-flight gate
 	// so at most 1 call is in flight and waits until MinInterval after the previous call finished.

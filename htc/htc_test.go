@@ -296,7 +296,7 @@ func TestPostCompletionRateLimiting(t *testing.T) {
 	defer srv.Close()
 
 	client, err := New(srv.URL, &Config{
-		RateLimitMode:  RateLimitFragile,
+		RateLimitMode:  RateLimitSerial,
 		MinInterval:    minGap,
 		DisableRetries: true,
 	})
@@ -423,22 +423,22 @@ func TestRateLimitConfigValidation(t *testing.T) {
 		t.Fatal("expected error when setting Burst with RateLimitNone")
 	}
 
-	// 3. RateLimitFragile applies DefaultMinInterval when MinInterval == 0, and rejects TokenBucket params
-	c, err = New("https://api.example.com", &Config{RateLimitMode: RateLimitFragile})
+	// 3. RateLimitSerial applies DefaultMinInterval when MinInterval == 0, and rejects TokenBucket params
+	c, err = New("https://api.example.com", &Config{RateLimitMode: RateLimitSerial})
 	if err != nil || c.cfg.MinInterval != DefaultMinInterval {
-		t.Fatalf("expected DefaultMinInterval for RateLimitFragile, got %v (err=%v)", c.cfg.MinInterval, err)
+		t.Fatalf("expected DefaultMinInterval for RateLimitSerial, got %v (err=%v)", c.cfg.MinInterval, err)
 	}
 	if _, err := New("https://api.example.com", &Config{
-		RateLimitMode:     RateLimitFragile,
+		RateLimitMode:     RateLimitSerial,
 		RequestsPerSecond: 10,
 	}); err == nil {
-		t.Fatal("expected error when setting RequestsPerSecond with RateLimitFragile")
+		t.Fatal("expected error when setting RequestsPerSecond with RateLimitSerial")
 	}
 	if _, err := New("https://api.example.com", &Config{
-		RateLimitMode: RateLimitFragile,
+		RateLimitMode: RateLimitSerial,
 		Burst:         2,
 	}); err == nil {
-		t.Fatal("expected error when setting Burst with RateLimitFragile")
+		t.Fatal("expected error when setting Burst with RateLimitSerial")
 	}
 
 	// 4. RateLimitTokenBucket applies defaults when 0, and rejects MinInterval
@@ -471,13 +471,13 @@ func TestBaseURLValidation(t *testing.T) {
 
 	// Invalid baseURLs must fail
 	invalidURLs := []string{
-		"api.example.com",         // missing scheme
-		"//api.example.com",       // scheme-relative, no http/https
-		"ftp://api.example.com",   // unsupported scheme
-		"https://",                // missing domain
-		"https:///v1/users",       // path only, missing domain
-		"https://:8080/v1",        // port only, missing domain
-		"http://example.com:bad",  // invalid port
+		"api.example.com",        // missing scheme
+		"//api.example.com",      // scheme-relative, no http/https
+		"ftp://api.example.com",  // unsupported scheme
+		"https://",               // missing domain
+		"https:///v1/users",      // path only, missing domain
+		"https://:8080/v1",       // port only, missing domain
+		"http://example.com:bad", // invalid port
 	}
 	for _, raw := range invalidURLs {
 		if _, err := New(raw, nil); err == nil {
@@ -485,6 +485,3 @@ func TestBaseURLValidation(t *testing.T) {
 		}
 	}
 }
-
-
-
