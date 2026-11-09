@@ -79,11 +79,13 @@ func TestVerbsAndPayloads(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := New(srv.URL, &Config{
-		Headers:          map[string]string{"X-Custom": "default-val"},
-		BearerToken:      "secret-token",
-		DisableRateLimit: true,
+	client, err := New(srv.URL, &Config{
+		Headers:     map[string]string{"X-Custom": "default-val"},
+		BearerToken: "secret-token",
 	})
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
 
 	ctx := context.Background()
 
@@ -219,12 +221,14 @@ func TestRetriesAndIdempotency(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := New(srv.URL, &Config{
-		MaxRetries:       3,
-		InitialWait:      10 * time.Millisecond,
-		MaxWait:          50 * time.Millisecond,
-		DisableRateLimit: true,
+	client, err := New(srv.URL, &Config{
+		MaxRetries:  3,
+		InitialWait: 10 * time.Millisecond,
+		MaxWait:     50 * time.Millisecond,
 	})
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
 
 	ctx := context.Background()
 
@@ -247,13 +251,15 @@ func TestRetriesAndIdempotency(t *testing.T) {
 	}
 
 	// Client with Config.RetryPost = true retries client.Post() automatically and preserves body
-	postClient := New(srv.URL, &Config{
-		MaxRetries:       3,
-		RetryPost:        true,
-		InitialWait:      10 * time.Millisecond,
-		MaxWait:          50 * time.Millisecond,
-		DisableRateLimit: true,
+	postClient, err := New(srv.URL, &Config{
+		MaxRetries:  3,
+		RetryPost:   true,
+		InitialWait: 10 * time.Millisecond,
+		MaxWait:     50 * time.Millisecond,
 	})
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
 	postAttempts.Store(0)
 	resp, err = postClient.Post(ctx, "/flaky-post", map[string]string{"payload": "important"})
 	if err != nil {
@@ -289,10 +295,14 @@ func TestPostCompletionRateLimiting(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := New(srv.URL, &Config{
+	client, err := New(srv.URL, &Config{
+		RateLimitMode:  RateLimitFragile,
 		MinInterval:    minGap,
 		DisableRetries: true,
 	})
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
 
 	// Launch 4 concurrent calls; the server must never receive call i+1
 	// earlier than ~minGap after call i finished.
@@ -355,11 +365,15 @@ func TestTokenBucketRateLimiting(t *testing.T) {
 	defer srv.Close()
 
 	// 20 requests/sec (1 token every 50ms) with a burst of 2
-	client := New(srv.URL, &Config{
+	client, err := New(srv.URL, &Config{
+		RateLimitMode:     RateLimitTokenBucket,
 		RequestsPerSecond: 20,
 		Burst:             2,
 		DisableRetries:    true,
 	})
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
 
 	start := time.Now()
 	const numCalls = 4
@@ -390,4 +404,87 @@ func TestTokenBucketRateLimiting(t *testing.T) {
 		t.Fatalf("expected token bucket to throttle calls 3 & 4 (~100ms+), but finished in %v", totalElapsed)
 	}
 }
+
+func TestRateLimitConfigValidation(t *testing.T) {
+	// 1. Default (nil or zero Config) uses RateLimitNone with no error
+	c, err := New("https://api.example.com", nil)
+	if err != nil || c.cfg.RateLimitMode != RateLimitNone || c.limiter != nil {
+		t.Fatalf("expected RateLimitNone by default, got cfg=%+v err=%v", c.cfg, err)
+	}
+
+	// 2. RateLimitNone with non-zero MinInterval or RequestsPerSecond or Burst is an error
+	if _, err := New("https://api.example.com", &Config{MinInterval: 50 * time.Millisecond}); err == nil {
+		t.Fatal("expected error when setting MinInterval with RateLimitNone")
+	}
+	if _, err := New("https://api.example.com", &Config{RequestsPerSecond: 5}); err == nil {
+		t.Fatal("expected error when setting RequestsPerSecond with RateLimitNone")
+	}
+	if _, err := New("https://api.example.com", &Config{Burst: 2}); err == nil {
+		t.Fatal("expected error when setting Burst with RateLimitNone")
+	}
+
+	// 3. RateLimitFragile applies DefaultMinInterval when MinInterval == 0, and rejects TokenBucket params
+	c, err = New("https://api.example.com", &Config{RateLimitMode: RateLimitFragile})
+	if err != nil || c.cfg.MinInterval != DefaultMinInterval {
+		t.Fatalf("expected DefaultMinInterval for RateLimitFragile, got %v (err=%v)", c.cfg.MinInterval, err)
+	}
+	if _, err := New("https://api.example.com", &Config{
+		RateLimitMode:     RateLimitFragile,
+		RequestsPerSecond: 10,
+	}); err == nil {
+		t.Fatal("expected error when setting RequestsPerSecond with RateLimitFragile")
+	}
+	if _, err := New("https://api.example.com", &Config{
+		RateLimitMode: RateLimitFragile,
+		Burst:         2,
+	}); err == nil {
+		t.Fatal("expected error when setting Burst with RateLimitFragile")
+	}
+
+	// 4. RateLimitTokenBucket applies defaults when 0, and rejects MinInterval
+	c, err = New("https://api.example.com", &Config{RateLimitMode: RateLimitTokenBucket})
+	if err != nil || c.cfg.RequestsPerSecond != DefaultRequestsPerSecond || c.cfg.Burst != DefaultBurst || c.limiter == nil {
+		t.Fatalf("expected DefaultRequestsPerSecond and DefaultBurst for RateLimitTokenBucket, got cfg=%+v err=%v", c.cfg, err)
+	}
+	if _, err := New("https://api.example.com", &Config{
+		RateLimitMode: RateLimitTokenBucket,
+		MinInterval:   100 * time.Millisecond,
+	}); err == nil {
+		t.Fatal("expected error when setting MinInterval with RateLimitTokenBucket")
+	}
+}
+
+func TestBaseURLValidation(t *testing.T) {
+	// Empty baseURL is allowed (for per-request full URLs)
+	if c, err := New("", nil); err != nil || c.baseURL != "" {
+		t.Fatalf("expected empty baseURL to be allowed, got err=%v", err)
+	}
+
+	// Valid http/https URLs with domain/host (and optional port/path) succeed and trim trailing slash
+	c, err := New("  HTTPS://api.example.com:8443/v1/  ", nil)
+	if err != nil {
+		t.Fatalf("expected valid baseURL to succeed, got %v", err)
+	}
+	if c.baseURL != "https://api.example.com:8443/v1" {
+		t.Fatalf("expected sanitized baseURL 'https://api.example.com:8443/v1', got %q", c.baseURL)
+	}
+
+	// Invalid baseURLs must fail
+	invalidURLs := []string{
+		"api.example.com",         // missing scheme
+		"//api.example.com",       // scheme-relative, no http/https
+		"ftp://api.example.com",   // unsupported scheme
+		"https://",                // missing domain
+		"https:///v1/users",       // path only, missing domain
+		"https://:8080/v1",        // port only, missing domain
+		"http://example.com:bad",  // invalid port
+	}
+	for _, raw := range invalidURLs {
+		if _, err := New(raw, nil); err == nil {
+			t.Fatalf("expected error for invalid baseURL %q, got nil", raw)
+		}
+	}
+}
+
+
 

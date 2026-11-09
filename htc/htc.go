@@ -34,12 +34,26 @@ const (
 	DefaultInitialWait         = 200 * time.Millisecond
 	DefaultMaxWait             = 5 * time.Second
 	DefaultMinInterval         = 100 * time.Millisecond
+	DefaultRequestsPerSecond   = 10.0
+	DefaultBurst               = 1
 	DefaultMaxResponseBodySize = 10 * 1024 * 1024 // 10 MB
 )
 
+// RateLimitMode specifies which client-side rate limiting mechanism to use.
+type RateLimitMode int
+
+const (
+	// RateLimitNone (the zero value) disables client-side rate limiting by default.
+	RateLimitNone RateLimitMode = iota
+	// RateLimitFragile serializes calls and enforces a minimum post-completion gap (MinInterval, default 100ms).
+	RateLimitFragile
+	// RateLimitTokenBucket uses golang.org/x/time/rate with RequestsPerSecond (default 10) and Burst (default 1).
+	RateLimitTokenBucket
+)
+
 // Config holds the configuration for a Client talking to a downstream service.
-// Zero values are replaced with sensible defaults; use DisableRetries or DisableRateLimit
-// (or negative values for MaxRetries / MinInterval) to turn those features off.
+// Zero values are replaced with sensible defaults. By default, no client-side rate limit applies
+// (RateLimitMode == RateLimitNone); the caller must opt in via RateLimitMode.
 type Config struct {
 	// Timeout is the maximum duration for a single HTTP attempt (default: 10s).
 	Timeout time.Duration
@@ -72,22 +86,14 @@ type Config struct {
 	// Note: if the server sends a Retry-After header larger than MaxWait, Retry-After is honored.
 	MaxWait time.Duration
 
-	// Rate Limiting (two modes supported):
-	//
-	// Mode 1 (Fragile servers - default when RequestsPerSecond is 0):
-	// MinInterval is the minimum time that must elapse after a call completes
-	// before the next call is sent to the server (default: 100ms when RequestsPerSecond == 0).
-	// This mode serializes calls so at most 1 call is in flight at a time.
-	//
-	// Mode 2 (General servers - Token Bucket via golang.org/x/time/rate):
-	// Set RequestsPerSecond > 0 (and optional Burst, default 1) to use a token bucket limiter.
-	// When RequestsPerSecond > 0 and MinInterval == 0, concurrent in-flight requests are allowed.
-	//
-	// Set DisableRateLimit: true (or MinInterval < 0) to disable client-side rate limiting completely.
+	// RateLimitMode selects the client-side rate limiting mechanism (default: RateLimitNone):
+	//   - RateLimitNone: no client-side rate limiting (MinInterval, RequestsPerSecond, and Burst must be 0).
+	//   - RateLimitFragile: post-completion serialized cooldown using MinInterval (default: 100ms; RequestsPerSecond and Burst must be 0).
+	//   - RateLimitTokenBucket: token bucket via golang.org/x/time/rate using RequestsPerSecond (default: 10) and Burst (default: 1; MinInterval must be 0).
+	RateLimitMode     RateLimitMode
 	MinInterval       time.Duration
 	RequestsPerSecond float64
 	Burst             int
-	DisableRateLimit  bool
 
 	// MaxResponseBodySize caps how many bytes are read from a response body (default: 10MB).
 	MaxResponseBodySize int64
@@ -100,12 +106,12 @@ type Client struct {
 	cfg        Config
 	httpClient *http.Client
 
-	// gate is used when MinInterval > 0 to serialize outbound calls so that the server
+	// gate is used when RateLimitMode == RateLimitFragile to serialize outbound calls so that the server
 	// never receives a new request until at least MinInterval after the previous call completed.
 	gate          chan struct{}
 	nextAllowedAt time.Time
 
-	// limiter is used when RequestsPerSecond > 0 for token-bucket rate limiting (golang.org/x/time/rate).
+	// limiter is used when RateLimitMode == RateLimitTokenBucket for token-bucket rate limiting (golang.org/x/time/rate).
 	limiter *rate.Limiter
 
 	// retryAfterMu protects retryAfterUntil for server-side Retry-After headers when running concurrently.
@@ -114,8 +120,27 @@ type Client struct {
 }
 
 // New creates a new Client for the given downstream baseURL.
-// If cfg is nil, default settings are used.
-func New(baseURL string, cfg *Config) *Client {
+// If baseURL is non-empty, it must have an http or https scheme and a non-empty host/domain.
+// If cfg is nil, default settings are used (retries enabled for GET, no client-side rate limiting).
+// Returns an error if baseURL is invalid or if rate limiting parameters are set for a mechanism other than cfg.RateLimitMode.
+func New(baseURL string, cfg *Config) (*Client, error) {
+
+	// Make sure that baseURL is a well-formed URL with a proper schema and domain (path is optional)
+	baseURL = strings.TrimSpace(baseURL)
+	if baseURL != "" {
+		u, err := url.Parse(baseURL)
+		if err != nil {
+			return nil, errl.Errorf("invalid baseURL %q: %w", baseURL, err)
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return nil, errl.Errorf("baseURL %q must specify http or https scheme", baseURL)
+		}
+		if u.Hostname() == "" {
+			return nil, errl.Errorf("baseURL %q must specify a domain/host", baseURL)
+		}
+		baseURL = strings.TrimRight(u.String(), "/")
+	}
+
 	var c Config
 	if cfg != nil {
 		c = *cfg
@@ -138,19 +163,37 @@ func New(baseURL string, cfg *Config) *Client {
 	}
 
 	var limiter *rate.Limiter
-	if c.MinInterval < 0 || c.RequestsPerSecond < 0 {
-		c.DisableRateLimit = true
-		c.MinInterval = 0
-		c.RequestsPerSecond = 0
-	} else if !c.DisableRateLimit {
-		if c.RequestsPerSecond > 0 {
-			if c.Burst <= 0 {
-				c.Burst = 1
-			}
-			limiter = rate.NewLimiter(rate.Limit(c.RequestsPerSecond), c.Burst)
-		} else if c.MinInterval == 0 {
+	switch c.RateLimitMode {
+	case RateLimitNone:
+		if c.MinInterval != 0 || c.RequestsPerSecond != 0 || c.Burst != 0 {
+			return nil, errl.Errorf("rate limit parameters (MinInterval, RequestsPerSecond, Burst) cannot be set when RateLimitMode is RateLimitNone")
+		}
+	case RateLimitFragile:
+		if c.RequestsPerSecond != 0 || c.Burst != 0 {
+			return nil, errl.Errorf("RequestsPerSecond and Burst cannot be set when RateLimitMode is RateLimitFragile")
+		}
+		if c.MinInterval < 0 {
+			return nil, errl.Errorf("MinInterval cannot be negative")
+		}
+		if c.MinInterval == 0 {
 			c.MinInterval = DefaultMinInterval
 		}
+	case RateLimitTokenBucket:
+		if c.MinInterval != 0 {
+			return nil, errl.Errorf("MinInterval cannot be set when RateLimitMode is RateLimitTokenBucket")
+		}
+		if c.RequestsPerSecond < 0 || c.Burst < 0 {
+			return nil, errl.Errorf("RequestsPerSecond and Burst cannot be negative")
+		}
+		if c.RequestsPerSecond == 0 {
+			c.RequestsPerSecond = DefaultRequestsPerSecond
+		}
+		if c.Burst == 0 {
+			c.Burst = DefaultBurst
+		}
+		limiter = rate.NewLimiter(rate.Limit(c.RequestsPerSecond), c.Burst)
+	default:
+		return nil, errl.Errorf("unknown RateLimitMode: %d", c.RateLimitMode)
 	}
 
 	if c.MaxResponseBodySize <= 0 {
@@ -168,14 +211,14 @@ func New(baseURL string, cfg *Config) *Client {
 	gate <- struct{}{}
 
 	return &Client{
-		baseURL: strings.TrimRight(baseURL, "/"),
+		baseURL: baseURL,
 		cfg:     c,
 		httpClient: &http.Client{
 			Timeout: c.Timeout,
 		},
 		gate:    gate,
 		limiter: limiter,
-	}
+	}, nil
 }
 
 // R creates a new fluent Request bound to the given context.
@@ -454,7 +497,7 @@ func (c *Client) execute(r *Request, method, path string) (*Response, error) {
 }
 
 // doSingleAttempt applies the configured rate-limiting strategy (serialized post-completion MinInterval
-// and/or token-bucket rate.Limiter, plus server Retry-After), performs one HTTP transaction, and reads the body.
+// or token-bucket rate.Limiter, plus server Retry-After), performs one HTTP transaction, and reads the body.
 func (c *Client) doSingleAttempt(
 	ctx context.Context,
 	method string,
@@ -463,7 +506,7 @@ func (c *Client) doSingleAttempt(
 	contentType string,
 	r *Request,
 ) (*Response, time.Duration, error) {
-	useSerializedGate := !c.cfg.DisableRateLimit && c.cfg.MinInterval > 0
+	useSerializedGate := c.cfg.RateLimitMode == RateLimitFragile
 
 	// 1a. If MinInterval is active (fragile-server mode), acquire the single-flight gate
 	// so at most 1 call is in flight and waits until MinInterval after the previous call finished.
